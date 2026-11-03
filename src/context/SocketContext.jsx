@@ -118,12 +118,12 @@ export function SocketProvider({ children }) {
     };
 
     ws.onclose = () => {
-      console.log("❌ Socket Closed");
+      console.log(" Socket Closed");
 
       setConnected(false);
 
       reconnectRef.current = setTimeout(() => {
-        console.log("🔄 Reconnecting...");
+        console.log(" Reconnecting...");
         connectSocket();
       }, 3000);
     };

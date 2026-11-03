@@ -1,4 +1,3 @@
-
 import { app, BrowserWindow, ipcMain } from "electron";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -33,6 +32,51 @@ const electronWindows = new Map();
 const windowScreenIds = new Map();
 
 const DISPLAY_HTTP_PORT = 1029;
+
+/* -------------------------------------------------------------------------- */
+/* Config                                                                      */
+/* -------------------------------------------------------------------------- */
+
+const DEFAULT_CONFIG = {
+  api: "http://localhost:8000",
+  ws: "ws://localhost:8000",
+};
+
+function getConfigPath() {
+  // In a packaged app, config.json should live next to the exe/resources,
+  // NOT inside app.asar, so it can be edited after install without rebuilding.
+  if (app.isPackaged) {
+    return path.join(process.resourcesPath, "config.json");
+  }
+
+  // In dev, read it from the project root.
+  return path.join(__dirname, "..", "..", "config.json");
+}
+
+function loadConfig() {
+  const configPath = getConfigPath();
+
+  try {
+    const raw = fs.readFileSync(configPath, "utf-8");
+    const parsed = JSON.parse(raw);
+
+    console.log("[DEBUG] Loaded config.json:", configPath, parsed);
+
+    return {
+      api: parsed.api || DEFAULT_CONFIG.api,
+      ws: parsed.ws || DEFAULT_CONFIG.ws,
+    };
+  } catch (error) {
+    console.warn(
+      `[WARN] Could not load config.json at ${configPath}, using defaults:`,
+      error.message
+    );
+
+    return DEFAULT_CONFIG;
+  }
+}
+
+const appConfig = loadConfig();
 
 /* -------------------------------------------------------------------------- */
 /* Database                                                                    */
@@ -108,52 +152,40 @@ function registerIPC() {
     return participantCache.getAll();
   });
 
-ipcMain.handle("close-window-by-pid", async (_event, pid) => {
-  const targetPid = Number(pid);
+  ipcMain.handle("close-window-by-pid", async (_event, pid) => {
+    const targetPid = Number(pid);
 
-  if (!Number.isInteger(targetPid) || targetPid <= 0) {
+    if (!Number.isInteger(targetPid) || targetPid <= 0) {
+      return {
+        success: false,
+        message: "Invalid PID",
+      };
+    }
+
+    const windows = BrowserWindow.getAllWindows();
+
+    const targetWindow = windows.find(
+      (win) => win.webContents.getOSProcessId() === targetPid
+    );
+
+    if (!targetWindow) {
+      console.warn(`[WINDOW] No Electron window found for PID ${targetPid}`);
+
+      return {
+        success: false,
+        message: `Window not found for PID ${targetPid}`,
+      };
+    }
+
+    console.log(`[WINDOW] Closing Electron window with PID ${targetPid}`);
+
+    targetWindow.destroy();
+
     return {
-      success: false,
-      message: "Invalid PID",
+      success: true,
+      pid: targetPid,
     };
-  }
-
-  const windows = BrowserWindow.getAllWindows();
-
-  const targetWindow = windows.find(
-    (win) => win.webContents.getOSProcessId() === targetPid
-  );
-
-  if (!targetWindow) {
-    console.warn(`[WINDOW] No Electron window found for PID ${targetPid}`);
-
-    return {
-      success: false,
-      message: `Window not found for PID ${targetPid}`,
-    };
-  }
-
-  console.log(`[WINDOW] Closing Electron window with PID ${targetPid}`);
-
-  targetWindow.destroy();
-
-  return {
-    success: true,
-    pid: targetPid,
-  };
-});
-// ipcMain.on("close-window-by-pid", (_event, pid) => {
-//   const targetWindow = BrowserWindow.getAllWindows().find(
-//     (win) => win.webContents.getOSProcessId() === Number(pid)
-//   );
-
-//   if (targetWindow && !targetWindow.isDestroyed()) {
-//     console.log(`[WINDOW] Closing window with PID ${pid}`);
-//     targetWindow.destroy();
-//   } else {
-//     console.warn(`[WINDOW] No window found for PID ${pid}`);
-//   }
-// });
+  });
 }
 
 /* -------------------------------------------------------------------------- */
@@ -173,15 +205,13 @@ function startDisplayHttpServer() {
     expressApp.use(express.static(rendererDir));
 
     expressApp.use((_req, res) => {
-      res.sendFile(indexPath, (error) => {
-        if (error) {
-          console.error("[ERROR] Failed to serve renderer:", error);
-
-          if (!res.headersSent) {
-            res.status(500).send("Renderer could not be loaded");
-          }
-        }
-      });
+      try {
+        const html = fs.readFileSync(indexPath, "utf-8");
+        res.status(200).set("Content-Type", "text/html").send(html);
+      } catch (error) {
+        console.error("[ERROR] Failed to serve renderer:", error);
+        res.status(500).send("Renderer could not be loaded");
+      }
     });
 
     httpServer = http.createServer(expressApp);
@@ -206,7 +236,7 @@ function startDisplayHttpServer() {
 /* -------------------------------------------------------------------------- */
 
 function getWindowsApiUrl() {
-  return "http://localhost:8000/screens/windows/?role=client";
+  return `${appConfig.api}/screens/windows/?role=client`;
 }
 
 async function fetchWindowsFromBackend() {
@@ -323,13 +353,6 @@ function installDevToolsShortcuts(electronWindow, windowId) {
 /* Window WebSocket management                                                 */
 /* -------------------------------------------------------------------------- */
 
-/**
- * Start a WebSocket for a Django Window ID and supply the PID getter
- * for the corresponding Electron BrowserWindow.
- *
- * The PID is obtained when the WebSocket opens, so it can be refreshed
- * if the renderer process changes before a later reconnection.
- */
 function ensureWindowSocketForWindow(windowId) {
   const normalizedWindowId = Number(windowId);
 
@@ -357,7 +380,6 @@ function ensureWindowSocketForWindow(windowId) {
     return;
   }
 
-  // This is a getter, not a fixed PID. It retrieves the current renderer PID.
   const getRendererPid = () => {
     if (electronWindow.isDestroyed()) {
       return null;
@@ -381,7 +403,8 @@ function ensureWindowSocketForWindow(windowId) {
       handleWindowSocketUpdate,
       normalizedWindowId,
       "client",
-      getRendererPid
+      getRendererPid,
+      appConfig.ws
     );
 
     stopWindowSockets.set(normalizedWindowId, stop);
@@ -560,22 +583,22 @@ async function createElectronWindow(windowData) {
   const existingWindow = electronWindows.get(windowId);
 
   if (existingWindow && !existingWindow.isDestroyed()) {
-  console.log(
-    `[DEBUG] Electron window ${windowId} already exists. Showing it.`
-  );
+    console.log(
+      `[DEBUG] Electron window ${windowId} already exists. Showing it.`
+    );
 
-  if (existingWindow.isMinimized()) {
-    existingWindow.restore();
+    if (existingWindow.isMinimized()) {
+      existingWindow.restore();
+    }
+
+    if (!existingWindow.isVisible()) {
+      existingWindow.show();
+    }
+
+    existingWindow.focus();
+
+    return existingWindow;
   }
-
-  if (!existingWindow.isVisible()) {
-    existingWindow.show();
-  }
-
-  existingWindow.focus();
-
-  return existingWindow;
-}
 
   const opacityValue = Number(config.opacity ?? 1);
 
@@ -686,7 +709,6 @@ async function createElectronWindow(windowData) {
 
     await electronWindow.loadURL(rendererUrl);
 
-    // Log the actual renderer PID after the page has loaded.
     const rendererPid = electronWindow.webContents.getOSProcessId();
 
     console.log(
@@ -784,8 +806,6 @@ async function createWindowsFromBackend() {
 function normalizeSocketWindowData(message) {
   console.log("[SCREEN WS] Normalizing received message:", message);
 
-  // Handle a direct backend window configuration.
-  // This object is not a WebSocket event and has no `type`.
   if (
     message &&
     typeof message === "object" &&
@@ -796,45 +816,23 @@ function normalizeSocketWindowData(message) {
 
     return {
       ...message,
-
-      // Keep backend Window ID as the Electron window key.
       window_id: Number(message.id),
-
-      // Explicitly map screen configuration.
       screen_id: Number(message.active_screen_details.id),
       screen_path: message.active_screen_details.path,
-
-      // Preserve position and dimensions.
       position_details: message.position_details,
       active_screen_details: message.active_screen_details,
     };
   }
 
-  // Keep your existing event-based normalization below this point.
   const type = String(message?.type ?? "").toLowerCase();
 
   console.log("[SCREEN WS] Normalizing event type:", type);
-
-  // Keep your existing switch(type) or other event handling here.
-  // ...
 }
-
-/* -------------------------------------------------------------------------- */
-/* Handle screen WebSocket messages                                            */
-/* -------------------------------------------------------------------------- */
-
 
 /* -------------------------------------------------------------------------- */
 /* Screen WebSocket helpers                                                    */
 /* -------------------------------------------------------------------------- */
 
-/**
- * Support flat and nested event formats:
- *
- * { type: "add_window", data: { id: 10, ... } }
- * { type: "add_window", window: { id: 10, ... } }
- * { type: "show_window", id: 10, is_active: true }
- */
 function getScreenEventPayload(message) {
   const outer = message ?? {};
 
@@ -859,9 +857,6 @@ function getScreenEventPayload(message) {
   };
 }
 
-/**
- * Get a complete window configuration using the existing API.
- */
 async function getBackendWindowConfiguration(windowId) {
   const windows = await fetchWindowsFromBackend();
 
@@ -872,9 +867,6 @@ async function getBackendWindowConfiguration(windowId) {
   );
 }
 
-/**
- * Display an already-created Electron window.
- */
 function showExistingElectronWindow(windowId) {
   const normalizedId = Number(windowId);
   const existingWindow = electronWindows.get(normalizedId);
@@ -902,9 +894,6 @@ function showExistingElectronWindow(windowId) {
   return true;
 }
 
-/**
- * Create a window when it does not exist, or show it when it does.
- */
 async function createOrShowWindow(windowId, suppliedData = null) {
   const normalizedId = Number(windowId);
 
@@ -913,12 +902,10 @@ async function createOrShowWindow(windowId, suppliedData = null) {
     return false;
   }
 
-  // Reuse the currently open Electron window.
   if (showExistingElectronWindow(normalizedId)) {
     return true;
   }
 
-  // The event may contain only an ID, so fetch the full configuration.
   let fullWindowData = suppliedData;
 
   let normalizedData = fullWindowData
@@ -999,19 +986,12 @@ async function createOrShowWindow(windowId, suppliedData = null) {
 async function handleScreenSocketMessage(message) {
   console.log("[SCREEN WS] Received:", message);
 
-  // --------------------------------------------------
-  // 1. Read event type from the outermost message
-  // --------------------------------------------------
   const type = String(
     message?.type ??
     message?.data?.type ??
     ""
   ).toLowerCase();
 
-  // --------------------------------------------------
-  // 2. Unwrap nested data until we reach the window
-  //    configuration.
-  // --------------------------------------------------
   let event = message;
 
   while (
@@ -1022,9 +1002,6 @@ async function handleScreenSocketMessage(message) {
     event = event.data;
   }
 
-  // --------------------------------------------------
-  // 3. Extract backend Window ID
-  // --------------------------------------------------
   const windowId = Number(
     event?.id ??
     event?.window_id ??
@@ -1037,11 +1014,6 @@ async function handleScreenSocketMessage(message) {
     event
   );
 
-  // --------------------------------------------------
-  // 4. Handle close_window
-  //
-  // Close the Electron window matching the backend ID.
-  // --------------------------------------------------
   if (type === "close_window") {
     if (
       !Number.isInteger(windowId) ||
@@ -1062,9 +1034,6 @@ async function handleScreenSocketMessage(message) {
     return;
   }
 
-  // --------------------------------------------------
-  // 5. Validate Window ID for other events
-  // --------------------------------------------------
   if (
     !Number.isInteger(windowId) ||
     windowId <= 0
@@ -1076,12 +1045,6 @@ async function handleScreenSocketMessage(message) {
     return;
   }
 
-  // --------------------------------------------------
-  // 6. Handle show_window
-  //
-  // is_active = false -> close Electron window
-  // is_active = true  -> show existing or create
-  // --------------------------------------------------
   if (type === "show_window") {
     const isActive = event?.is_active;
 
@@ -1119,9 +1082,6 @@ async function handleScreenSocketMessage(message) {
     return;
   }
 
-  // --------------------------------------------------
-  // 7. Handle add_window / create_window
-  // --------------------------------------------------
   if (
     type === "add_window" ||
     type === "create_window" ||
@@ -1144,9 +1104,6 @@ async function handleScreenSocketMessage(message) {
     return;
   }
 
-  // --------------------------------------------------
-  // 8. Handle other event types
-  // --------------------------------------------------
   console.log(
     `[SCREEN WS] Ignoring event "${type}".`
   );
@@ -1164,7 +1121,7 @@ function startScreenWebSocket() {
 
   console.log("[SCREEN WS] Starting screen creation listener.");
 
-  stopScreenSocket = startScreenSocket(handleScreenSocketMessage);
+  stopScreenSocket = startScreenSocket(handleScreenSocketMessage, appConfig.ws);
 }
 
 /* -------------------------------------------------------------------------- */
